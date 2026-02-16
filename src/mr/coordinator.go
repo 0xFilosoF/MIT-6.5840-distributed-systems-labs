@@ -10,7 +10,6 @@ import (
 	"time"
 )
 
-// const SUCCESS = math.MaxInt32
 const taskTimeout = 10 * time.Second
 
 type Coordinator struct {
@@ -39,12 +38,13 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 }
 
 func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
-	if len(c.tasksCh) == 0 {
+	select {
+	case *reply = <-c.tasksCh:
+	default:
 		reply.TaskType = NONE
 		return nil
 	}
 
-	*reply = <-c.tasksCh
 	c.mu.Lock()
 
 	switch reply.TaskType {
@@ -63,32 +63,37 @@ func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
 	c.mu.Unlock()
 
 	go func() {
-		timer := time.NewTimer(time.Second)
-		defer timer.Stop()
+		<-time.After(taskTimeout)
 
-		select {
-		case <-timer.C:
-			c.mu.RLock()
-			defer c.mu.RUnlock()
-			if c.getStatusFromReply(reply) == DONE {
-				return
-			}
-		case <-time.After(taskTimeout):
-			c.mu.RLock()
-			defer c.mu.RUnlock()
-			if c.getStatusFromReply(reply) == DONE {
-				return
-			}
-			c.tasksCh <- *reply
+		c.mu.RLock()
+		if c.getStatusFromReply(reply) == DONE {
+			c.mu.RUnlock()
+			return
 		}
+		c.mu.RUnlock()
+
+		c.mu.Lock()
+		switch reply.TaskType {
+		case MAP:
+			if c.mapTasks[reply.TaskIndex] == PROGRESS {
+				c.mapTasks[reply.TaskIndex] = IDLE
+			}
+		case REDUCE:
+			if c.reduceTasks[reply.TaskIndex] == PROGRESS {
+				c.reduceTasks[reply.TaskIndex] = IDLE
+			}
+		}
+		c.mu.Unlock()
+
+		c.tasksCh <- *reply
 	}()
 
 	return nil
 }
 
 func (c *Coordinator) TaskReport(args *ReportTaskArgs, reply *ReportTaskReply) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	switch args.TaskType {
 	case MAP:
@@ -105,9 +110,6 @@ func (c *Coordinator) TaskReport(args *ReportTaskArgs, reply *ReportTaskReply) e
 		}
 		c.reduceTasks[args.TaskIndex] = DONE
 		c.wgReduce.Done()
-	case NONE:
-		reply.OK = true
-		return nil
 	}
 
 	reply.OK = true
@@ -143,6 +145,8 @@ func StartReduceTasks(c *Coordinator) {
 
 func CoordinatorDone(c *Coordinator) {
 	c.wgReduce.Wait()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.done = true
 }
 
@@ -161,6 +165,8 @@ func (c *Coordinator) server(sockname string) {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
 	return c.done
 }
 

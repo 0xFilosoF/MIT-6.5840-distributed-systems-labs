@@ -1,15 +1,30 @@
 package mr
 
-import "log"
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
+import (
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"sync"
+	"time"
+)
 
+const taskTimeout = 10 * time.Second
 
 type Coordinator struct {
 	// Your definitions here.
 
+	nMap        int
+	nReduce     int
+	mapTasks    []TaskStatus // len nMap
+	reduceTasks []TaskStatus // len nReduce
+	wgMap       sync.WaitGroup
+	wgReduce    sync.WaitGroup
+	tasksCh     chan TaskReply
+
+	mu   sync.RWMutex
+	done bool
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -22,6 +37,118 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
+func (c *Coordinator) GetTask(args *TaskArgs, reply *TaskReply) error {
+	select {
+	case *reply = <-c.tasksCh:
+	default:
+		reply.TaskType = NONE
+		return nil
+	}
+
+	c.mu.Lock()
+
+	switch reply.TaskType {
+	case MAP:
+		if c.mapTasks[reply.TaskIndex] == IDLE {
+			c.mapTasks[reply.TaskIndex] = PROGRESS
+		}
+	case REDUCE:
+		if c.reduceTasks[reply.TaskIndex] == IDLE {
+			c.reduceTasks[reply.TaskIndex] = PROGRESS
+		}
+	case NONE:
+		return nil
+	}
+
+	c.mu.Unlock()
+
+	go func() {
+		<-time.After(taskTimeout)
+
+		c.mu.RLock()
+		if c.getStatusFromReply(reply) == DONE {
+			c.mu.RUnlock()
+			return
+		}
+		c.mu.RUnlock()
+
+		c.mu.Lock()
+		switch reply.TaskType {
+		case MAP:
+			if c.mapTasks[reply.TaskIndex] == PROGRESS {
+				c.mapTasks[reply.TaskIndex] = IDLE
+			}
+		case REDUCE:
+			if c.reduceTasks[reply.TaskIndex] == PROGRESS {
+				c.reduceTasks[reply.TaskIndex] = IDLE
+			}
+		}
+		c.mu.Unlock()
+
+		c.tasksCh <- *reply
+	}()
+
+	return nil
+}
+
+func (c *Coordinator) TaskReport(args *ReportTaskArgs, reply *ReportTaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	switch args.TaskType {
+	case MAP:
+		if c.mapTasks[args.TaskIndex] != PROGRESS {
+			reply.OK = false
+			return nil
+		}
+		c.mapTasks[args.TaskIndex] = DONE
+		c.wgMap.Done()
+	case REDUCE:
+		if c.reduceTasks[args.TaskIndex] != PROGRESS {
+			reply.OK = false
+			return nil
+		}
+		c.reduceTasks[args.TaskIndex] = DONE
+		c.wgReduce.Done()
+	}
+
+	reply.OK = true
+	return nil
+}
+
+func (c *Coordinator) getStatusFromReply(reply *TaskReply) TaskStatus {
+	switch reply.TaskType {
+	case MAP:
+		return c.mapTasks[reply.TaskIndex]
+	case REDUCE:
+		return c.reduceTasks[reply.TaskIndex]
+	// never happen
+	default:
+		return IDLE
+	}
+}
+
+func StartReduceTasks(c *Coordinator) {
+	c.wgMap.Wait()
+	c.wgReduce.Add(c.nReduce)
+
+	for i := 0; i < c.nReduce; i++ {
+		c.tasksCh <- TaskReply{
+			TaskType:  REDUCE,
+			TaskIndex: i,
+			NMap:      c.nMap,
+			NReduce:   c.nReduce,
+		}
+	}
+	go CoordinatorDone(c)
+}
+
+func CoordinatorDone(c *Coordinator) {
+	c.wgReduce.Wait()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.done = true
+}
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server(sockname string) {
@@ -38,23 +165,39 @@ func (c *Coordinator) server(sockname string) {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-
-	return ret
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.done
 }
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(sockname string, files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
+	buflen := max(len(files), nReduce)
 
-	// Your code here.
+	c := Coordinator{
+		nMap:        len(files),
+		nReduce:     nReduce,
+		mapTasks:    make([]TaskStatus, len(files)),
+		reduceTasks: make([]TaskStatus, nReduce),
+		wgMap:       sync.WaitGroup{},
+		wgReduce:    sync.WaitGroup{},
+		tasksCh:     make(chan TaskReply, buflen),
+	}
 
-
+	c.wgMap.Add(c.nMap)
+	for i, file := range files {
+		c.tasksCh <- TaskReply{
+			TaskType:  MAP,
+			File:      file,
+			TaskIndex: i,
+			NMap:      c.nMap,
+			NReduce:   c.nReduce,
+		}
+	}
+	go StartReduceTasks(&c)
 	c.server(sockname)
+
 	return &c
 }

@@ -46,4 +46,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	ConflictEntryTerm  int
+	ConflictEntryIndex int
 }

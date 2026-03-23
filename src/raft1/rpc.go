@@ -40,3 +40,12 @@ func (rf *Raft) sendAppendEntries(
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
+
+func (rf *Raft) sendInstallSnapshot(
+	server int,
+	args *InstallSnapshotArgs,
+	reply *InstallSnapshotReply,
+) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
